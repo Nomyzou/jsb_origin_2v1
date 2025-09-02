@@ -39,26 +39,39 @@ class Share2v1JSBSimRunner(Runner):
 
         # [Selfplay] allocate memory for opponent policy/data in training
         if self.use_selfplay:
+            # 自博弈算法选择器
             from algorithms.utils.selfplay import get_algorithm
             self.selfplay_algo = get_algorithm(self.all_args.selfplay_algorithm)
 
+            # 断言检查：确保对手数量不超过训练线程数
             assert self.all_args.n_choose_opponents <= self.n_rollout_threads, \
                 "Number of different opponents({}) must less than or equal to number of training threads({})!" \
                 .format(self.all_args.n_choose_opponents, self.n_rollout_threads)
             
-            # 策略池管理
+            # 策略池管理 - ELO评分系统
             self.policy_pool = {'latest': self.all_args.init_elo}  # type: dict[str, float]
             
-            # 对手策略实例 (蓝方飞机)
+            # Create a reduced observation space for opponent policy (first 15 dimensions)
+            # This matches the pre-trained model's expected input size
+            from gymnasium import spaces
+            opponent_obs_space = spaces.Box(
+                low=-10, high=10., 
+                shape=(15,),  # Only use first 15 dimensions
+                dtype=np.float32
+            )
+            
             self.opponent_policy = [
-                Policy(self.all_args, self.obs_space, self.share_obs_space, self.act_space, device=self.device)
+                Policy(self.all_args, opponent_obs_space, self.share_obs_space, self.act_space, device=self.device)
                 for _ in range(self.all_args.n_choose_opponents)]
             
             # 环境分配策略
             self.opponent_env_split = np.array_split(np.arange(self.n_rollout_threads), len(self.opponent_policy))
             
-            # 对手数据存储 (蓝方飞机)
-            self.opponent_obs = np.zeros_like(self.buffer.obs[0])
+            # 对手数据存储 (蓝方飞机) - 使用15维观察空间
+            # 创建正确维度的对手观察数据存储
+            opponent_obs_shape = list(self.buffer.obs[0].shape)
+            opponent_obs_shape[2] = 15  # 修改观察维度为15
+            self.opponent_obs = np.zeros(opponent_obs_shape, dtype=self.buffer.obs[0].dtype)
             self.opponent_rnn_states = np.zeros_like(self.buffer.rnn_states_actor[0])
             self.opponent_masks = np.ones_like(self.buffer.masks[0])
 
@@ -142,7 +155,11 @@ class Share2v1JSBSimRunner(Runner):
         obs, share_obs = self.envs.reset()
         # [Selfplay] divide ego/opponent of initial obs
         if self.use_selfplay:
-            self.opponent_obs = obs[:, 2:, ...]  # 蓝方飞机 (B0100)
+            # 只存储前15维观察数据，匹配预训练模型的输入维度
+            self.opponent_obs = obs[:, 2:, :15, ...]  # 蓝方飞机 (B0100)，只取前15维
+            # 确保敌方观察数据不为空
+            if self.opponent_obs.size == 0:
+                logging.warning("Warning: opponent_obs is empty in warmup!")
             obs = obs[:, :2, ...]                # 红方飞机 (A0100, A0200)
             share_obs = share_obs[:, :2, ...]
         self.buffer.step = 0
@@ -170,12 +187,30 @@ class Share2v1JSBSimRunner(Runner):
             opponent_actions = np.zeros_like(actions)
             for policy_idx, policy in enumerate(self.opponent_policy):
                 env_idx = self.opponent_env_split[policy_idx]
-                opponent_action, opponent_rnn_states \
-                    = policy.act(np.concatenate(self.opponent_obs[env_idx]),
-                                 np.concatenate(self.opponent_rnn_states[env_idx]),
-                                 np.concatenate(self.opponent_masks[env_idx]))
-                opponent_actions[env_idx] = np.array(np.split(_t2n(opponent_action), len(env_idx)))
-                self.opponent_rnn_states[env_idx] = np.array(np.split(_t2n(opponent_rnn_states), len(env_idx)))
+                # 修复索引问题：确保env_idx不为空且正确索引
+                if len(env_idx) > 0:
+                    opponent_obs_batch = self.opponent_obs[env_idx]
+                    opponent_rnn_batch = self.opponent_rnn_states[env_idx]
+                    opponent_mask_batch = self.opponent_masks[env_idx]
+                    
+                    # 添加调试信息
+                    if step == 0:  # 只在第一步打印调试信息
+                        logging.info(f"Debug - policy_idx: {policy_idx}, env_idx: {env_idx}")
+                        logging.info(f"Debug - opponent_obs shape: {self.opponent_obs.shape}")
+                        logging.info(f"Debug - opponent_obs_batch shape: {opponent_obs_batch.shape}")
+                        logging.info(f"Debug - opponent_rnn_batch shape: {opponent_rnn_batch.shape}")
+                        logging.info(f"Debug - opponent_mask_batch shape: {opponent_mask_batch.shape}")
+                    
+                    # 确保数据维度正确
+                    if opponent_obs_batch.size > 0:
+                        # 只使用前15维观察数据，匹配预训练模型的输入维度
+                        opponent_obs_15d = np.concatenate(opponent_obs_batch)[:, :15]
+                        opponent_action, opponent_rnn_states \
+                            = policy.act(opponent_obs_15d,
+                                         np.concatenate(opponent_rnn_batch),
+                                         np.concatenate(opponent_mask_batch))
+                        opponent_actions[env_idx] = np.array(np.split(_t2n(opponent_action), len(env_idx)))
+                        self.opponent_rnn_states[env_idx] = np.array(np.split(_t2n(opponent_rnn_states), len(env_idx)))
             actions = np.concatenate((actions, opponent_actions), axis=1)
 
         return values, actions, action_log_probs, rnn_states_actor, rnn_states_critic
@@ -206,8 +241,16 @@ class Share2v1JSBSimRunner(Runner):
         
         # [Selfplay] divide ego/opponent of collecting data
         if self.use_selfplay:
-            self.opponent_obs = obs[:, 2:, ...]  # 蓝方飞机 (B0100)
-            self.opponent_masks = masks[:, 2:, ...]
+            # 确保敌方数据不为空
+            if obs.shape[1] >= 3:  # 确保有足够的智能体
+                # 只存储前15维观察数据，匹配预训练模型的输入维度
+                self.opponent_obs = obs[:, 2:, :15, ...]  # 蓝方飞机 (B0100)，只取前15维
+                self.opponent_masks = masks[:, 2:, ...]
+            else:
+                logging.warning(f"Warning: Not enough agents for opponent data. obs shape: {obs.shape}")
+                # 创建空的敌方数据
+                self.opponent_obs = np.zeros((self.n_rollout_threads, 0, 15, *obs.shape[3:]), dtype=obs.dtype)
+                self.opponent_masks = np.zeros((self.n_rollout_threads, 0, *masks.shape[2:]), dtype=masks.dtype)
 
             obs = obs[:, :2, ...]                # 红方飞机 (A0100, A0200)
             share_obs = share_obs[:, :2, ...]
