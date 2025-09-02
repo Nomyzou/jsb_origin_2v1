@@ -22,6 +22,16 @@ class Share2v1JSBSimRunner(Runner):
         self.num_agents = self.envs.num_agents  # 3个智能体 (2红方 + 1蓝方)
         self.use_selfplay = self.all_args.use_selfplay  # type: bool
 
+        # 添加环境配置检查
+        logging.info("=== 环境配置检查 ===")
+        logging.info(f"envs.num_agents: {self.envs.num_agents}")
+        logging.info(f"self.num_agents: {self.num_agents}")
+        logging.info(f"self.n_rollout_threads: {self.n_rollout_threads}")
+        logging.info(f"self.obs_space: {self.obs_space}")
+        logging.info(f"self.share_obs_space: {self.share_obs_space}")
+        logging.info(f"self.act_space: {self.act_space}")
+        logging.info("=== 环境配置检查结束 ===")
+
         # policy & algorithm
         if self.algorithm_name == "mappo":
             from algorithms.mappo.ppo_trainer import PPOTrainer as Trainer
@@ -36,6 +46,15 @@ class Share2v1JSBSimRunner(Runner):
             self.buffer = SharedReplayBuffer(self.all_args, 2, self.obs_space, self.share_obs_space, self.act_space)
         else:
             self.buffer = SharedReplayBuffer(self.all_args, self.num_agents, self.obs_space, self.share_obs_space, self.act_space)
+
+        # 在创建buffer后立即检查
+        logging.info("=== Buffer创建后检查 ===")
+        logging.info(f"buffer.obs shape: {self.buffer.obs.shape}")
+        logging.info(f"buffer.share_obs shape: {self.buffer.share_obs.shape}")
+        logging.info(f"buffer.rnn_states_actor shape: {self.buffer.rnn_states_actor.shape}")
+        logging.info(f"buffer.rnn_states_critic shape: {self.buffer.rnn_states_critic.shape}")
+        logging.info(f"buffer.masks shape: {self.buffer.masks.shape}")
+        logging.info("=== Buffer创建后检查结束 ===")
 
         # [Selfplay] allocate memory for opponent policy/data in training
         if self.use_selfplay:
@@ -67,6 +86,31 @@ class Share2v1JSBSimRunner(Runner):
             # 环境分配策略
             self.opponent_env_split = np.array_split(np.arange(self.n_rollout_threads), len(self.opponent_policy))
             
+            # 在对手数据初始化前检查
+            logging.info("=== 对手数据初始化前检查 ===")
+            logging.info(f"self.buffer.rnn_states_actor[0].shape: {self.buffer.rnn_states_actor[0].shape}")
+            logging.info(f"self.buffer.obs[0].shape: {self.buffer.obs[0].shape}")
+            logging.info(f"self.buffer.masks[0].shape: {self.buffer.masks[0].shape}")
+            
+            # 检查形状的每个维度
+            rnn_shape = self.buffer.rnn_states_actor[0].shape
+            obs_shape = self.buffer.obs[0].shape
+            mask_shape = self.buffer.masks[0].shape
+            
+            logging.info(f"RNN形状分析: [时间步, 环境数, 智能体数, 层数, 隐藏维度] = {rnn_shape}")
+            logging.info(f"观察形状分析: [环境数, 智能体数, 观察维度] = {obs_shape}")
+            logging.info(f"掩码形状分析: [环境数, 智能体数, 掩码维度] = {mask_shape}")
+            
+            # 检查是否有异常的0维度
+            if 0 in rnn_shape:
+                logging.error(f"警告: RNN状态包含0维度: {rnn_shape}")
+            if 0 in obs_shape:
+                logging.error(f"警告: 观察包含0维度: {obs_shape}")
+            if 0 in mask_shape:
+                logging.error(f"警告: 掩码包含0维度: {mask_shape}")
+            
+            logging.info("=== 对手数据初始化前检查结束 ===")
+            
             # 对手数据存储 (蓝方飞机) - 使用15维观察空间
             # 创建正确维度的对手观察数据存储
             opponent_obs_shape = list(self.buffer.obs[0].shape)
@@ -74,6 +118,22 @@ class Share2v1JSBSimRunner(Runner):
             self.opponent_obs = np.zeros(opponent_obs_shape, dtype=self.buffer.obs[0].dtype)
             self.opponent_rnn_states = np.zeros_like(self.buffer.rnn_states_actor[0])
             self.opponent_masks = np.ones_like(self.buffer.masks[0])
+
+            # 在对手数据初始化后检查
+            logging.info("=== 对手数据初始化后检查 ===")
+            logging.info(f"opponent_obs shape: {self.opponent_obs.shape}")
+            logging.info(f"opponent_rnn_states shape: {self.opponent_rnn_states.shape}")
+            logging.info(f"opponent_masks shape: {self.opponent_masks.shape}")
+            
+            # 检查对手数据是否有异常
+            if 0 in self.opponent_obs.shape:
+                logging.error(f"错误: opponent_obs包含0维度: {self.opponent_obs.shape}")
+            if 0 in self.opponent_rnn_states.shape:
+                logging.error(f"错误: opponent_rnn_states包含0维度: {self.opponent_rnn_states.shape}")
+            if 0 in self.opponent_masks.shape:
+                logging.error(f"错误: opponent_masks包含0维度: {self.opponent_masks.shape}")
+            
+            logging.info("=== 对手数据初始化后检查结束 ===")
 
             # 评估用对手策略
             if self.use_eval:
@@ -155,6 +215,16 @@ class Share2v1JSBSimRunner(Runner):
         obs, share_obs = self.envs.reset()
         # [Selfplay] divide ego/opponent of initial obs
         if self.use_selfplay:
+            # 在数据分割前添加检查
+            logging.info("=== Warmup中数据分割前检查 ===")
+            logging.info(f"原始obs shape: {obs.shape}")
+            logging.info(f"原始share_obs shape: {share_obs.shape}")
+            
+            # 检查数据分割的逻辑
+            logging.info(f"红方飞机数量: 2 (A0100, A0200)")
+            logging.info(f"蓝方飞机数量: {obs.shape[1] - 2} (B0100, B0200...)")
+            logging.info(f"总智能体数量: {obs.shape[1]}")
+            
             # 只存储前15维观察数据，匹配预训练模型的输入维度
             self.opponent_obs = obs[:, 2:, :15, ...]  # 蓝方飞机 (B0100)，只取前15维
             # 确保敌方观察数据不为空
@@ -162,6 +232,11 @@ class Share2v1JSBSimRunner(Runner):
                 logging.warning("Warning: opponent_obs is empty in warmup!")
             obs = obs[:, :2, ...]                # 红方飞机 (A0100, A0200)
             share_obs = share_obs[:, :2, ...]
+            
+            logging.info(f"分割后红方obs shape: {obs.shape}")
+            logging.info(f"分割后蓝方opponent_obs shape: {self.opponent_obs.shape}")
+            logging.info("=== Warmup中数据分割前检查结束 ===")
+            
         self.buffer.step = 0
         self.buffer.obs[0] = obs.copy()
         self.buffer.share_obs[0] = share_obs.copy()
@@ -169,6 +244,32 @@ class Share2v1JSBSimRunner(Runner):
     @torch.no_grad()
     def collect(self, step):
         self.policy.prep_rollout()
+        
+        # 在策略调用前添加检查
+        if step == 0:
+            logging.info("=== Collect中策略调用前检查 ===")
+            logging.info(f"step: {step}")
+            logging.info(f"buffer.share_obs[{step}] shape: {self.buffer.share_obs[step].shape}")
+            logging.info(f"buffer.obs[{step}] shape: {self.buffer.obs[step].shape}")
+            logging.info(f"buffer.rnn_states_actor[{step}] shape: {self.buffer.rnn_states_actor[step].shape}")
+            logging.info(f"buffer.rnn_states_critic[{step}] shape: {self.buffer.rnn_states_critic[step].shape}")
+            logging.info(f"buffer.masks[{step}] shape: {self.buffer.masks[step].shape}")
+            
+            if self.use_selfplay:
+                logging.info(f"opponent_obs shape: {self.opponent_obs.shape}")
+                logging.info(f"opponent_rnn_states shape: {self.opponent_rnn_states.shape}")
+                logging.info(f"opponent_masks shape: {self.opponent_masks.shape}")
+                
+                # 检查对手数据是否包含0维度
+                if 0 in self.opponent_obs.shape:
+                    logging.error(f"错误: opponent_obs包含0维度: {self.opponent_obs.shape}")
+                if 0 in self.opponent_rnn_states.shape:
+                    logging.error(f"错误: opponent_rnn_states包含0维度: {self.opponent_rnn_states.shape}")
+                if 0 in self.opponent_masks.shape:
+                    logging.error(f"错误: opponent_masks包含0维度: {self.opponent_masks.shape}")
+            
+            logging.info("=== Collect中策略调用前检查结束 ===")
+        
         values, actions, action_log_probs, rnn_states_actor, rnn_states_critic \
             = self.policy.get_actions(np.concatenate(self.buffer.share_obs[step]),
                                       np.concatenate(self.buffer.obs[step]),
@@ -193,13 +294,31 @@ class Share2v1JSBSimRunner(Runner):
                     opponent_rnn_batch = self.opponent_rnn_states[env_idx]
                     opponent_mask_batch = self.opponent_masks[env_idx]
                     
-                    # 添加调试信息
-                    if step == 0:  # 只在第一步打印调试信息
-                        logging.info(f"Debug - policy_idx: {policy_idx}, env_idx: {env_idx}")
-                        logging.info(f"Debug - opponent_obs shape: {self.opponent_obs.shape}")
-                        logging.info(f"Debug - opponent_obs_batch shape: {opponent_obs_batch.shape}")
-                        logging.info(f"Debug - opponent_rnn_batch shape: {opponent_rnn_batch.shape}")
-                        logging.info(f"Debug - opponent_mask_batch shape: {opponent_mask_batch.shape}")
+                    # 在对手策略调用前添加调试
+                    if step == 0:
+                        logging.info(f"=== 对手策略调用调试 ===")
+                        logging.info(f"policy_idx: {policy_idx}, env_idx: {env_idx}")
+                        logging.info(f"opponent_obs_batch shape: {opponent_obs_batch.shape}")
+                        logging.info(f"opponent_rnn_batch shape: {opponent_rnn_batch.shape}")
+                        logging.info(f"opponent_mask_batch shape: {opponent_mask_batch.shape}")
+                        
+                        # 检查concatenate后的形状
+                        try:
+                            opponent_rnn_concat = np.concatenate(opponent_rnn_batch)
+                            opponent_mask_concat = np.concatenate(opponent_mask_batch)
+                            logging.info(f"np.concatenate(opponent_rnn_batch) shape: {opponent_rnn_concat.shape}")
+                            logging.info(f"np.concatenate(opponent_mask_batch) shape: {opponent_mask_concat.shape}")
+                        except Exception as e:
+                            logging.info(f"Concatenate error: {e}")
+                            logging.info(f"opponent_rnn_batch type: {type(opponent_rnn_batch)}")
+                            logging.info(f"opponent_rnn_batch length: {len(opponent_rnn_batch)}")
+                            for i, item in enumerate(opponent_rnn_batch):
+                                if item is not None:
+                                    logging.info(f"opponent_rnn_batch[{i}] shape: {item.shape}")
+                                else:
+                                    logging.info(f"opponent_rnn_batch[{i}] is None")
+                        
+                        logging.info(f"=== 对手策略调用调试结束 ===")
                     
                     # 确保数据维度正确
                     if opponent_obs_batch.size > 0:
