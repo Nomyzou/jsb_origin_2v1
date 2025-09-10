@@ -7,7 +7,7 @@ import logging
 from ..tasks import SingleCombatTask
 from ..core.catalog import Catalog as c
 from ..core.simulatior import MissileSimulator
-from ..reward_functions import AltitudeReward, PostureReward, EventDrivenReward, MissilePostureReward
+from ..reward_functions import AltitudeReward, PostureReward, EventDrivenReward, MissilePostureReward,EvasionReward
 from ..termination_conditions import ExtremeState, LowAltitude, Overload, Timeout, SafeReturn
 from ..utils.utils import get_AO_TA_R, LLA2NEU, get_root_dir
 from ..model.baseline_actor import BaselineActor
@@ -20,7 +20,8 @@ class MultipleCombatTask(SingleCombatTask):
         self.reward_functions = [
             AltitudeReward(self.config),
             PostureReward(self.config),
-            EventDrivenReward(self.config)
+            EventDrivenReward(self.config),
+            EvasionReward(self.config)
         ]
 
         self.termination_conditions = [
@@ -285,3 +286,423 @@ class HierarchicalMultipleCombatShootTask(HierarchicalMultipleCombatTask):
                     MissileSimulator.create(parent=agent, target=agent.enemies[target_index], uid=new_missile_uid))
                 self._remaining_missiles[agent_id] -= 1
                 self._last_shoot_time[agent_id] = env.current_step
+
+
+class MultipleCombat1v1StyleTask(MultipleCombatTask):
+    """
+    4v4场景的1v1风格任务类
+    每架飞机只观察对应编号的敌机，观察空间为15维（与1v1相同）
+    """
+    
+    def __init__(self, config):
+        super().__init__(config)
+        
+    def load_observation_space(self):
+        # 15维观察空间：9维自身信息 + 6维对应敌机信息
+        self.obs_length = 15
+        self.observation_space = spaces.Box(low=-10, high=10., shape=(self.obs_length,))
+        self.share_observation_space = spaces.Box(low=-10, high=10., shape=(self.num_agents * self.obs_length,))
+    
+    def get_obs(self, env, agent_id):
+        """
+        获取1v1风格的观察
+        每架飞机只观察对应编号的敌机
+        A0100 -> B0100, A0200 -> B0200, A0300 -> B0300, A0400 -> B0400
+        """
+        norm_obs = np.zeros(self.obs_length)
+        
+        # (1) ego info normalization (9维)
+        ego_state = np.array(env.agents[agent_id].get_property_values(self.state_var))
+        ego_cur_ned = LLA2NEU(*ego_state[:3], env.center_lon, env.center_lat, env.center_alt)
+        ego_feature = np.array([*ego_cur_ned, *(ego_state[6:9])])
+        
+        norm_obs[0] = ego_state[2] / 5000            # 0. ego altitude   (unit: 5km)
+        norm_obs[1] = np.sin(ego_state[3])           # 1. ego_roll_sin
+        norm_obs[2] = np.cos(ego_state[3])          # 2. ego_roll_cos
+        norm_obs[3] = np.sin(ego_state[4])           # 3. ego_pitch_sin
+        norm_obs[4] = np.cos(ego_state[4])           # 4. ego_pitch_cos
+        norm_obs[5] = ego_state[9] / 340             # 5. ego v_body_x   (unit: mh)
+        norm_obs[6] = ego_state[10] / 340            # 6. ego v_body_y   (unit: mh)
+        norm_obs[7] = ego_state[11] / 340            # 7. ego v_body_z   (unit: mh)
+        norm_obs[8] = ego_state[12] / 340            # 8. ego vc   (unit: mh)
+        
+        # (2) 找到对应编号的敌机
+        target_enemy_id = self._get_corresponding_enemy(agent_id)
+        if target_enemy_id in env.agents and env.agents[target_enemy_id].is_alive:
+            enemy_state = np.array(env.agents[target_enemy_id].get_property_values(self.state_var))
+            enemy_cur_ned = LLA2NEU(*enemy_state[:3], env.center_lon, env.center_lat, env.center_alt)
+            enemy_feature = np.array([*enemy_cur_ned, *(enemy_state[6:9])])
+            
+            # 计算相对信息 (6维)
+            AO, TA, R, side_flag = get_AO_TA_R(ego_feature, enemy_feature, return_side=True)
+            norm_obs[9] = (enemy_state[9] - ego_state[9]) / 340      # 9. delta_v_body_x (unit: mh)
+            norm_obs[10] = (enemy_state[2] - ego_state[2]) / 1000    # 10. delta_altitude (unit: km)
+            norm_obs[11] = AO                                        # 11. ego_AO (unit: rad)
+            norm_obs[12] = TA                                        # 12. ego_TA (unit: rad)
+            norm_obs[13] = R / 10000                                # 13. relative_distance (unit: 10km)
+            norm_obs[14] = side_flag                                 # 14. side_flag
+        else:
+            # 如果对应敌机不存在或已死亡，填充零值
+            norm_obs[9:15] = 0.0
+        
+        norm_obs = np.clip(norm_obs, self.observation_space.low, self.observation_space.high)
+        return norm_obs
+    
+    def _get_corresponding_enemy(self, agent_id):
+        """
+        根据飞机编号找到对应的敌机
+        A0100 -> B0100, A0200 -> B0200, A0300 -> B0300, A0400 -> B0400
+        """
+        if agent_id.startswith('A'):
+            # 红方飞机，对应蓝方敌机
+            enemy_id = 'B' + agent_id[1:]
+        elif agent_id.startswith('B'):
+            # 蓝方飞机，对应红方敌机
+            enemy_id = 'A' + agent_id[1:]
+        else:
+            # 未知编号，返回第一个敌机
+            return None
+        
+        return enemy_id
+
+
+class HierarchicalMultipleCombat1v1StyleTask(HierarchicalMultipleCombatTask):
+    """
+    4v4场景的1v1风格分层任务类
+    继承分层结构，但使用1v1风格的观察空间
+    """
+    
+    def __init__(self, config):
+        super().__init__(config)
+        
+    def load_observation_space(self):
+        # 15维观察空间：9维自身信息 + 6维对应敌机信息
+        self.obs_length = 15
+        self.observation_space = spaces.Box(low=-10, high=10., shape=(self.obs_length,))
+        self.share_observation_space = spaces.Box(low=-10, high=10., shape=(self.num_agents * self.obs_length,))
+    
+    def get_obs(self, env, agent_id):
+        """
+        获取1v1风格的观察
+        每架飞机只观察对应编号的敌机
+        A0100 -> B0100, A0200 -> B0200, A0300 -> B0300, A0400 -> B0400
+        """
+        norm_obs = np.zeros(self.obs_length)
+        
+        # (1) ego info normalization (9维)
+        ego_state = np.array(env.agents[agent_id].get_property_values(self.state_var))
+        ego_cur_ned = LLA2NEU(*ego_state[:3], env.center_lon, env.center_lat, env.center_alt)
+        ego_feature = np.array([*ego_cur_ned, *(ego_state[6:9])])
+        
+        norm_obs[0] = ego_state[2] / 5000            # 0. ego altitude   (unit: 5km)
+        norm_obs[1] = np.sin(ego_state[3])           # 1. ego_roll_sin
+        norm_obs[2] = np.cos(ego_state[3])          # 2. ego_roll_cos
+        norm_obs[3] = np.sin(ego_state[4])           # 3. ego_pitch_sin
+        norm_obs[4] = np.cos(ego_state[4])           # 4. ego_pitch_cos
+        norm_obs[5] = ego_state[9] / 340             # 5. ego v_body_x   (unit: mh)
+        norm_obs[6] = ego_state[10] / 340            # 6. ego v_body_y   (unit: mh)
+        norm_obs[7] = ego_state[11] / 340            # 7. ego v_body_z   (unit: mh)
+        norm_obs[8] = ego_state[12] / 340            # 8. ego vc   (unit: mh)
+        
+        # (2) 找到对应编号的敌机
+        target_enemy_id = self._get_corresponding_enemy(agent_id)
+        if target_enemy_id in env.agents and env.agents[target_enemy_id].is_alive:
+            enemy_state = np.array(env.agents[target_enemy_id].get_property_values(self.state_var))
+            enemy_cur_ned = LLA2NEU(*enemy_state[:3], env.center_lon, env.center_lat, env.center_alt)
+            enemy_feature = np.array([*enemy_cur_ned, *(enemy_state[6:9])])
+            
+            # 计算相对信息 (6维)
+            AO, TA, R, side_flag = get_AO_TA_R(ego_feature, enemy_feature, return_side=True)
+            norm_obs[9] = (enemy_state[9] - ego_state[9]) / 340      # 9. delta_v_body_x (unit: mh)
+            norm_obs[10] = (enemy_state[2] - ego_state[2]) / 1000    # 10. delta_altitude (unit: km)
+            norm_obs[11] = AO                                        # 11. ego_AO (unit: rad)
+            norm_obs[12] = TA                                        # 12. ego_TA (unit: rad)
+            norm_obs[13] = R / 10000                                # 13. relative_distance (unit: 10km)
+            norm_obs[14] = side_flag                                 # 14. side_flag
+        else:
+            # 如果对应敌机不存在或已死亡，填充零值
+            norm_obs[9:15] = 0.0
+        
+        norm_obs = np.clip(norm_obs, self.observation_space.low, self.observation_space.high)
+        return norm_obs
+    
+    def _get_corresponding_enemy(self, agent_id):
+        """
+        根据飞机编号找到对应的敌机
+        A0100 -> B0100, A0200 -> B0200, A0300 -> B0300, A0400 -> B0400
+        """
+        if agent_id.startswith('A'):
+            # 红方飞机，对应蓝方敌机
+            enemy_id = 'B' + agent_id[1:]
+        elif agent_id.startswith('B'):
+            # 蓝方飞机，对应红方敌机
+            enemy_id = 'A' + agent_id[1:]
+        else:
+            # 未知编号，返回第一个敌机
+            return None
+        
+        return enemy_id
+
+
+# ... existing code ...
+
+class HierarchicalMultipleCombat2v1StyleTask(HierarchicalMultipleCombatTask):
+    """
+    5v4场景的2v1风格分层任务类
+    支持两种观察空间：
+    1. 15维：9维自身信息 + 6维对应敌机信息
+    2. 21维：9维自身信息 + 6维友机信息 + 6维对应敌机信息
+    
+    蓝方飞机：固定使用15维观察空间
+    红方飞机：根据运行情况动态决定使用15维还是21维观察空间
+    """
+    
+    def __init__(self, config):
+        super().__init__(config)
+        # 红方飞机观察空间类型映射（运行时动态设置）
+        self.red_obs_type_mapping = {}
+        # 蓝方飞机固定使用15维观察空间
+        self.blue_obs_type_mapping = {}
+        
+    def set_red_obs_type(self, agent_id, obs_type):
+        """
+        设置红方飞机的观察空间类型
+        Args:
+            agent_id: 飞机ID
+            obs_type: 0表示15维，1表示21维
+        """
+        if agent_id.startswith('A'):
+            self.red_obs_type_mapping[agent_id] = obs_type
+    
+    def set_red_obs_types(self, obs_type_dict):
+        """
+        批量设置红方飞机的观察空间类型
+        Args:
+            obs_type_dict: {agent_id: obs_type} 字典
+        """
+        for agent_id, obs_type in obs_type_dict.items():
+            if agent_id.startswith('A'):
+                self.red_obs_type_mapping[agent_id] = obs_type
+    
+    def load_observation_space(self):
+        # 支持两种观察空间：15维和21维
+        self.obs_length_15 = 15  # 9 + 6
+        self.obs_length_21 = 21  # 9 + 6 + 6
+        
+        # 使用最大观察空间作为统一空间
+        self.obs_length = self.obs_length_21
+        self.observation_space = spaces.Box(low=-10, high=10., shape=(self.obs_length,))
+        self.share_observation_space = spaces.Box(low=-10, high=10., shape=(self.num_agents * self.obs_length,))
+    
+    def get_obs(self, env, agent_id):
+        """
+        获取2v1风格的观察
+        蓝方飞机固定使用15维观察空间
+        红方飞机根据设置使用15维或21维观察空间
+        """
+        if agent_id.startswith('B'):
+            # 蓝方飞机固定使用15维观察空间
+            return self._get_obs_15d(env, agent_id)
+        elif agent_id.startswith('A'):
+            # 红方飞机根据设置使用观察空间
+            obs_type = self.red_obs_type_mapping.get(agent_id, 0)  # 默认15维
+            if obs_type == 0:
+                return self._get_obs_15d(env, agent_id)
+            else:
+                return self._get_obs_21d(env, agent_id)
+        else:
+            # 未知飞机类型，使用15维观察空间
+            return self._get_obs_15d(env, agent_id)
+    
+    def _get_obs_15d(self, env, agent_id):
+        """
+        获取15维观察空间
+        9维自身信息 + 6维对应敌机信息
+        """
+        norm_obs = np.zeros(self.obs_length)
+        
+        # (1) ego info normalization (9维)
+        ego_state = np.array(env.agents[agent_id].get_property_values(self.state_var))
+        ego_cur_ned = LLA2NEU(*ego_state[:3], env.center_lon, env.center_lat, env.center_alt)
+        ego_feature = np.array([*ego_cur_ned, *(ego_state[6:9])])
+        
+        norm_obs[0] = ego_state[2] / 5000            # 0. ego altitude   (unit: 5km)
+        norm_obs[1] = np.sin(ego_state[3])           # 1. ego_roll_sin
+        norm_obs[2] = np.cos(ego_state[3])          # 2. ego_roll_cos
+        norm_obs[3] = np.sin(ego_state[4])           # 3. ego_pitch_sin
+        norm_obs[4] = np.cos(ego_state[4])           # 4. ego_pitch_cos
+        norm_obs[5] = ego_state[9] / 340             # 5. ego v_body_x   (unit: mh)
+        norm_obs[6] = ego_state[10] / 340            # 6. ego v_body_y   (unit: mh)
+        norm_obs[7] = ego_state[11] / 340            # 7. ego v_body_z   (unit: mh)
+        norm_obs[8] = ego_state[12] / 340            # 8. ego vc   (unit: mh)
+        
+        # (2) 找到对应编号的敌机
+        target_enemy_id = self._get_corresponding_enemy(agent_id)
+        if target_enemy_id in env.agents and env.agents[target_enemy_id].is_alive:
+            enemy_state = np.array(env.agents[target_enemy_id].get_property_values(self.state_var))
+            enemy_cur_ned = LLA2NEU(*enemy_state[:3], env.center_lon, env.center_lat, env.center_alt)
+            enemy_feature = np.array([*enemy_cur_ned, *(enemy_state[6:9])])
+            
+            # 计算相对信息 (6维)
+            AO, TA, R, side_flag = get_AO_TA_R(ego_feature, enemy_feature, return_side=True)
+            norm_obs[9] = (enemy_state[9] - ego_state[9]) / 340      # 9. delta_v_body_x (unit: mh)
+            norm_obs[10] = (enemy_state[2] - ego_state[2]) / 1000    # 10. delta_altitude (unit: km)
+            norm_obs[11] = AO                                        # 11. ego_AO (unit: rad)
+            norm_obs[12] = TA                                        # 12. ego_TA (unit: rad)
+            norm_obs[13] = R / 10000                                # 13. relative_distance (unit: 10km)
+            norm_obs[14] = side_flag                                 # 14. side_flag
+        else:
+            # 如果对应敌机不存在或已死亡，填充零值
+            norm_obs[9:15] = 0.0
+        
+        norm_obs = np.clip(norm_obs, self.observation_space.low, self.observation_space.high)
+        return norm_obs
+    
+    def _get_obs_21d(self, env, agent_id):
+        """
+        获取21维观察空间
+        9维自身信息 + 6维友机信息 + 6维对应敌机信息
+        """
+        norm_obs = np.zeros(self.obs_length)
+        
+        # (1) ego info normalization (9维)
+        ego_state = np.array(env.agents[agent_id].get_property_values(self.state_var))
+        ego_cur_ned = LLA2NEU(*ego_state[:3], env.center_lon, env.center_lat, env.center_alt)
+        ego_feature = np.array([*ego_cur_ned, *(ego_state[6:9])])
+        
+        norm_obs[0] = ego_state[2] / 5000            # 0. ego altitude   (unit: 5km)
+        norm_obs[1] = np.sin(ego_state[3])           # 1. ego_roll_sin
+        norm_obs[2] = np.cos(ego_state[3])          # 2. ego_roll_cos
+        norm_obs[3] = np.sin(ego_state[4])           # 3. ego_pitch_sin
+        norm_obs[4] = np.cos(ego_state[4])           # 4. ego_pitch_cos
+        norm_obs[5] = ego_state[9] / 340             # 5. ego v_body_x   (unit: mh)
+        norm_obs[6] = ego_state[10] / 340            # 6. ego v_body_y   (unit: mh)
+        norm_obs[7] = ego_state[11] / 340            # 7. ego v_body_z   (unit: mh)
+        norm_obs[8] = ego_state[12] / 340            # 8. ego vc   (unit: mh)
+        
+        # (2) 找到友机信息 (6维)
+        partner_id = self._get_partner_aircraft(agent_id)
+        if partner_id in env.agents and env.agents[partner_id].is_alive:
+            partner_state = np.array(env.agents[partner_id].get_property_values(self.state_var))
+            partner_cur_ned = LLA2NEU(*partner_state[:3], env.center_lon, env.center_lat, env.center_alt)
+            partner_feature = np.array([*partner_cur_ned, *(partner_state[6:9])])
+            
+            # 计算与友机的相对信息 (6维)
+            AO, TA, R, side_flag = get_AO_TA_R(ego_feature, partner_feature, return_side=True)
+            norm_obs[9] = (partner_state[9] - ego_state[9]) / 340      # 9. delta_v_body_x (unit: mh)
+            norm_obs[10] = (partner_state[2] - ego_state[2]) / 1000    # 10. delta_altitude (unit: km)
+            norm_obs[11] = AO                                        # 11. ego_AO (unit: rad)
+            norm_obs[12] = TA                                        # 12. ego_TA (unit: rad)
+            norm_obs[13] = R / 10000                                # 13. relative_distance (unit: 10km)
+            norm_obs[14] = side_flag                                 # 14. side_flag
+        else:
+            # 如果友机不存在或已死亡，填充零值
+            norm_obs[9:15] = 0.0
+        
+        # (3) 找到对应编号的敌机 (6维)
+        target_enemy_id = self._get_corresponding_enemy(agent_id)
+        if target_enemy_id in env.agents and env.agents[target_enemy_id].is_alive:
+            enemy_state = np.array(env.agents[target_enemy_id].get_property_values(self.state_var))
+            enemy_cur_ned = LLA2NEU(*enemy_state[:3], env.center_lon, env.center_lat, env.center_alt)
+            enemy_feature = np.array([*enemy_cur_ned, *(enemy_state[6:9])])
+            
+            # 计算与敌机的相对信息 (6维)
+            AO, TA, R, side_flag = get_AO_TA_R(ego_feature, enemy_feature, return_side=True)
+            norm_obs[15] = (enemy_state[9] - ego_state[9]) / 340      # 15. delta_v_body_x (unit: mh)
+            norm_obs[16] = (enemy_state[2] - ego_state[2]) / 1000    # 16. delta_altitude (unit: km)
+            norm_obs[17] = AO                                        # 17. ego_AO (unit: rad)
+            norm_obs[18] = TA                                        # 18. ego_TA (unit: rad)
+            norm_obs[19] = R / 10000                                # 19. relative_distance (unit: 10km)
+            norm_obs[20] = side_flag                                 # 20. side_flag
+        else:
+            # 如果对应敌机不存在或已死亡，填充零值
+            norm_obs[15:21] = 0.0
+        
+        norm_obs = np.clip(norm_obs, self.observation_space.low, self.observation_space.high)
+        return norm_obs
+    
+    def _get_corresponding_enemy(self, agent_id):
+        """
+        根据飞机编号找到对应的敌机
+        A0100 -> B0100, A0200 -> B0200, A0300 -> B0300, A0400 -> B0400, A0500 -> B0400
+        """
+        if agent_id.startswith('A'):
+            # 红方飞机，对应蓝方敌机
+            if agent_id == 'A0500':
+                # A0500对应B0400（因为蓝方只有4架飞机）
+                enemy_id = 'B0400'
+            else:
+                enemy_id = 'B' + agent_id[1:]
+        elif agent_id.startswith('B'):
+            # 蓝方飞机，对应红方敌机
+            if agent_id == 'B0400':
+                # B0400对应A0400和A0500（因为红方有5架飞机）
+                # 这里选择A0400作为主要对应
+                enemy_id = 'A0400'
+            else:
+                enemy_id = 'A' + agent_id[1:]
+        else:
+            # 未知编号，返回第一个敌机
+            return None
+        
+        return enemy_id
+    
+    def _get_partner_aircraft(self, agent_id):
+        """
+        获取友机编号
+        为21维观察空间的飞机分配友机
+        """
+        if agent_id.startswith('A'):
+            # 红方飞机友机配对
+            if agent_id == 'A0100':
+                return 'A0200'  # A0100的友机是A0200
+            elif agent_id == 'A0200':
+                return 'A0100'  # A0200的友机是A0100
+            elif agent_id == 'A0300':
+                return 'A0400'  # A0300的友机是A0400
+            elif agent_id == 'A0400':
+                return 'A0300'  # A0400的友机是A0300
+            elif agent_id == 'A0500':
+                return 'A0400'  # A0500的友机是A0400
+            else:
+                return None
+        else:
+            # 蓝方飞机不使用21维观察空间，不需要友机
+            return None
+    
+    def get_obs_type(self, agent_id):
+        """
+        获取指定飞机的观察空间类型
+        返回: 0表示15维，1表示21维
+        """
+        if agent_id.startswith('B'):
+            return 0  # 蓝方飞机固定使用15维
+        elif agent_id.startswith('A'):
+            return self.red_obs_type_mapping.get(agent_id, 0)  # 红方飞机根据设置
+        else:
+            return 0  # 默认15维
+    
+    def get_obs_length(self, agent_id):
+        """
+        获取指定飞机的观察空间长度
+        """
+        obs_type = self.get_obs_type(agent_id)
+        if obs_type == 0:
+            return self.obs_length_15
+        else:
+            return self.obs_length_21
+    
+    def get_red_obs_types(self):
+        """
+        获取所有红方飞机的观察空间类型
+        返回: {agent_id: obs_type} 字典
+        """
+        return self.red_obs_type_mapping.copy()
+    
+    def reset(self, env):
+        """
+        重置任务，包括红方飞机观察空间类型映射
+        """
+        # 重置红方飞机观察空间类型映射
+        self.red_obs_type_mapping = {}
+        return super().reset(env)

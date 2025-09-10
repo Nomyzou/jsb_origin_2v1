@@ -1,0 +1,163 @@
+# task config
+task: hierarchical_multiplecombat_2v1_style
+
+# simulation config
+sim_freq: 60
+agent_interaction_steps: 12 # step 0.2s
+
+# termination config
+max_steps: 1000             # episode length: 200s
+altitude_limit: 2500
+acceleration_limit_x: 10.0
+acceleration_limit_y: 10.0
+acceleration_limit_z: 10.0
+
+# aircraft config - 5v4 厦门海域配置
+aircraft_configs: {
+  A0100: {
+    color: Red,
+    model: f16,
+    init_state: {
+      ic_long_gc_deg: 118.089424,  # 厦门中心
+      ic_lat_geod_deg: 24.479834,
+      ic_h_sl_ft: 25000,
+      ic_psi_true_deg: 0.0,
+      ic_u_fps: 800.0,
+    },
+  },
+  A0200: {
+    color: Red,
+    model: f16,
+    init_state: {
+      ic_long_gc_deg: 118.189424,  # 厦门东侧
+      ic_lat_geod_deg: 24.479834,
+      ic_h_sl_ft: 25000,
+      ic_psi_true_deg: 0.0,
+      ic_u_fps: 800.0,
+    },
+  },
+  A0300: {
+    color: Red,
+    model: f16,
+    init_state: {
+      ic_long_gc_deg: 117.989424,  # 厦门西侧
+      ic_lat_geod_deg: 24.479834,
+      ic_h_sl_ft: 25000,
+      ic_psi_true_deg: 0.0,
+      ic_u_fps: 800.0,
+    },
+  },
+  A0400: {
+    color: Red,
+    model: f16,
+    init_state: {
+      ic_long_gc_deg: 118.089424,  # 厦门北侧
+      ic_lat_geod_deg: 24.579834,
+      ic_h_sl_ft: 25000,
+      ic_psi_true_deg: 0.0,
+      ic_u_fps: 800.0,
+    },
+  },
+  A0500: {
+    color: Red,
+    model: f16,
+    init_state: {
+      ic_long_gc_deg: 118.089424,  # 厦门南侧
+      ic_lat_geod_deg: 24.379834,
+      ic_h_sl_ft: 25000,
+      ic_psi_true_deg: 0.0,
+      ic_u_fps: 800.0,
+    },
+  },
+  B0100: {
+    color: Blue,
+    model: f16,
+    init_state: {
+      ic_h_sl_ft: 20000,
+      ic_long_gc_deg: 118.289424,  # 厦门东侧外围
+      ic_lat_geod_deg: 24.479834,
+      ic_psi_true_deg: 180.0,
+      ic_u_fps: 800.0,
+    },
+  },
+  B0200: {
+    color: Blue,
+    model: f16,
+    init_state: {
+      ic_h_sl_ft: 20000,
+      ic_long_gc_deg: 117.889424,  # 厦门西侧外围
+      ic_lat_geod_deg: 24.479834,
+      ic_psi_true_deg: 180.0,
+      ic_u_fps: 800.0,
+    },
+  },
+  B0300: {
+    color: Blue,
+    model: f16,
+    init_state: {
+      ic_h_sl_ft: 20000,
+      ic_long_gc_deg: 118.089424,  # 厦门北侧外围
+      ic_lat_geod_deg: 24.679834,
+      ic_psi_true_deg: 180.0,
+      ic_u_fps: 800.0,
+    },
+  },
+  B0400: {
+    color: Blue,
+    model: f16,
+    init_state: {
+      ic_h_sl_ft: 20000,
+      ic_long_gc_deg: 118.089424,  # 厦门南侧外围
+      ic_lat_geod_deg: 24.279834,
+      ic_psi_true_deg: 180.0,
+      ic_u_fps: 800.0,
+    },
+  },
+}
+
+# reward config
+reward_config: {
+  altitude_reward: {
+    target_altitude: 20000,
+    altitude_tolerance: 5000,
+    reward_scale: 1.0,
+  },
+  posture_reward: {
+    reward_scale: 1.0,
+  },
+  event_driven_reward: {
+    reward_scale: 1.0,
+  },
+  damage_reward: {
+    reward_scale: 2.0,
+  },
+  survival_reward: {
+    reward_scale: 1.0,
+  },
+}
+
+# termination config
+termination_config: {
+  safe_return: {
+    return_altitude: 20000,
+    return_distance: 50000,
+    return_tolerance: 5000,
+  },
+  extreme_state: {
+    max_altitude: 30000,
+    min_altitude: 1000,
+    max_acceleration: 10.0,
+  },
+  overload: {
+    max_overload: 10.0,
+  },
+  low_altitude: {
+    min_altitude: 1000,
+  },
+  timeout: {
+    max_steps: 1000,
+  },
+  aircraft_destroyed: {
+    enabled: true,
+  },
+}

@@ -1,7 +1,7 @@
 import numpy as np
 from typing import Tuple, Dict, Any
 from .env_base import BaseEnv
-from ..tasks.multiplecombat_task import HierarchicalMultipleCombatShootTask, HierarchicalMultipleCombatTask, MultipleCombatTask
+from ..tasks.multiplecombat_task import HierarchicalMultipleCombatShootTask, HierarchicalMultipleCombatTask, MultipleCombatTask, MultipleCombat1v1StyleTask, HierarchicalMultipleCombat1v1StyleTask, HierarchicalMultipleCombat2v1StyleTask
 
 
 class MultipleCombatEnv(BaseEnv):
@@ -25,6 +25,12 @@ class MultipleCombatEnv(BaseEnv):
             self.task = HierarchicalMultipleCombatTask(self.config)
         elif taskname == 'hierarchical_multiplecombat_shoot':
             self.task = HierarchicalMultipleCombatShootTask(self.config)
+        elif taskname == 'multiplecombat_1v1_style':
+            self.task = MultipleCombat1v1StyleTask(self.config)
+        elif taskname == 'hierarchical_multiplecombat_1v1_style':
+            self.task = HierarchicalMultipleCombat1v1StyleTask(self.config)
+        elif taskname == 'hierarchical_multiplecombat_2v1_style':
+            self.task = HierarchicalMultipleCombat2v1StyleTask(self.config)
         else:
             raise NotImplementedError(f"Unknown taskname: {taskname}")
 

@@ -1,11 +1,15 @@
 import numpy as np
 import torch
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv, MultipleCombatEnv
 from envs.env_wrappers import SubprocVecEnv, DummyVecEnv
 from envs.JSBSim.core.catalog import Catalog as c
 from algorithms.ppo.ppo_actor import PPOActor
 import logging
 logging.basicConfig(level=logging.DEBUG)
+from datetime import datetime
 
 class Args:
     def __init__(self) -> None:
@@ -25,19 +29,28 @@ def _t2n(x):
 
 num_agents = 2
 render = True
-ego_policy_index = 1040
-enm_policy_index = 0
+ego_policy_index = '96'
+enm_policy_index = '96'
 episode_rewards = 0
-ego_run_dir = "/home/lqh/jyh/CloseAirCombat/scripts/results/SingleCombat/1v1/NoWeapon/HierarchySelfplay/ppo/artillery_check/wandb/latest-run/files"
-enm_run_dir = "/home/lqh/jyh/CloseAirCombat/scripts/results/SingleCombat/1v1/NoWeapon/HierarchySelfplay/ppo/artillery_check/wandb/latest-run/files"
-experiment_name = ego_run_dir.split('/')[-4]
+ego_run_dir = "scripts/results/SingleCombat/1v1/ShootMissile/HierarchySelfplay/ppo/v1/wandb/latest-run/files"
+enm_run_dir = "scripts/results/SingleCombat/1v1/ShootMissile/HierarchySelfplay/ppo/v1/wandb/latest-run/files"
+experiment_name ="single_1v1_shoot_missile"
 
-env = SingleCombatEnv("1v1/NoWeapon/Selfplay")
+env = SingleCombatEnv("1v1/ShootMissile/HierarchySelfplay")
 env.seed(0)
-args = Args()
+# 检测可用的设备
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
 
-ego_policy = PPOActor(args, env.observation_space, env.action_space, device=torch.device("cuda"))
-enm_policy = PPOActor(args, env.observation_space, env.action_space, device=torch.device("cuda"))
+args = Args()
+args.tpdv = dict(dtype=torch.float32, device=device)
+
+ego_policy = PPOActor(args, env.observation_space, env.action_space, device=device)
+enm_policy = PPOActor(args, env.observation_space, env.action_space, device=device)
 ego_policy.eval()
 enm_policy.eval()
 ego_policy.load_state_dict(torch.load(ego_run_dir + f"/actor_{ego_policy_index}.pt"))
@@ -66,7 +79,7 @@ while True:
     rewards = rewards[:num_agents // 2, ...]
     episode_rewards += rewards
     if render:
-        env.render(mode='txt', filepath=f'{experiment_name}.txt.acmi')
+        env.render(mode='txt', filepath=f'{experiment_name}_{datetime.now().strftime("%Y%m%d_%H%M")}.txt.acmi')
     if dones.all():
         print(infos)
         break
